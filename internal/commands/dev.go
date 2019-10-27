@@ -3,17 +3,20 @@ package commands
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
-	"github.com/deislabs/cnab-go/action"
-	"github.com/docker/app/internal/cnab"
 	"github.com/docker/app/internal/packager"
-	"github.com/docker/app/internal/store"
+	"github.com/docker/app/render"
 	"github.com/docker/cli/cli"
-	"github.com/docker/docker/pkg/namesgenerator"
 	"github.com/pkg/errors"
 
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/command/stack"
+	"github.com/docker/cli/cli/command/stack/options"
+	"github.com/docker/cli/cli/command/stack/swarm"
+	composetypes "github.com/docker/cli/cli/compose/types"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 type devOptions struct {
@@ -31,46 +34,79 @@ func devCmd(dockerCli command.Cli) *cobra.Command {
 		Args:    cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			application := args[0]
-			composeApp, err := packager.Extract(application)
+			app, err := packager.Extract(application)
 			if err != nil {
 				return errors.Wrap(err, "extract")
 			}
-			defer composeApp.Cleanup()
+			defer app.Cleanup()
 
-			bundle, err := packager.MakeBundleFromApp(dockerCli, composeApp, nil)
+			parameters := packager.ExtractCNABParametersValues(packager.ExtractCNABParameterMapping(app.Parameters()), os.Environ())
+			rendered, err := render.Render(app, parameters, nil)
 			if err != nil {
-				return errors.Wrap(err, "make bundle")
+				return err
 			}
-			for name, im := range bundle.Images {
-				fmt.Println(name, im.Image)
-			}
-			bind, err := cnab.RequiredBindMount("default", "kubernetes", dockerCli.ContextStore())
-			if err != nil {
-				return errors.Wrap(err, "requirebindmount")
-			}
-			driverImpl, errBuf := cnab.PrepareDriver(dockerCli, bind, nil)
-
-			installation, err := store.NewInstallation(namesgenerator.GetRandomName(0), "")
-			installation.Bundle = bundle
-			inst := &action.Install{
-				Driver: driverImpl,
-			}
-			// bundle.Credentials[internal.CredentialDockerContextName] = "default"
-			creds, err := prepareCredentialSet(bundle)
-			if err != nil {
-				return errors.Wrap(err, "creds")
-			}
-			{
-				defer muteDockerCli(dockerCli)()
-				err = inst.Run(&installation.Claim, creds, os.Stdout)
-				if err != nil {
-					return fmt.Errorf("Failed to run App: %s\n%s", err, errBuf)
+			services := []composetypes.ServiceConfig{}
+			on := composetypes.ServiceConfig{}
+			for _, service := range rendered.Services {
+				if opts.on[0] != service.Name {
+					services = append(services, service)
+				} else {
+					on = service
+					fmt.Printf("Not adding %q\n", service.Name)
 				}
 			}
-			return nil
+			rendered.Services = services
+			orchestrator, err := dockerCli.StackOrchestrator("kubernetes")
+			if err != nil {
+				return err
+			}
+
+			err = stack.RunDeploy(dockerCli,
+				getFlagset(),
+				rendered,
+				orchestrator,
+				options.Deploy{
+					Namespace:        application,
+					ResolveImage:     swarm.ResolveImageAlways,
+					SendRegistryAuth: false,
+				})
+			if err != nil {
+				return err
+			}
+			dir, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			b := exec.Command("docker", "build", "-t", on.Name, on.Name)
+			err = b.Run()
+			if err != nil {
+				return err
+			}
+			// fmt.Println("telepresence",
+			// 	"--new-deployment", on.Name,
+			// 	"--expose", fmt.Sprint(on.Ports[0].Published)+":"+fmt.Sprint(on.Ports[0].Target),
+			// 	"--docker-run", "--rm",
+			// 	"-p", fmt.Sprint(on.Ports[0].Published)+":"+fmt.Sprint(on.Ports[0].Target),
+			// 	"-v", dir+"/vote:/app",
+			// 	on.Name)
+			tele := exec.Command("telepresence",
+				"--new-deployment", on.Name,
+				"--expose", fmt.Sprint(on.Ports[0].Published)+":"+fmt.Sprint(on.Ports[0].Target),
+				"--docker-run", "--rm",
+				"-p", fmt.Sprint(on.Ports[0].Published)+":"+fmt.Sprint(on.Ports[0].Target),
+				"-v", dir+"/vote:/app",
+				on.Name)
+
+			return tele.Run()
 		},
 	}
 	cmd.Flags().StringArrayVar(&opts.on, "on", []string{}, "The service you are working on")
 	cmd.Flags().StringArrayVar(&opts.debug, "debug", []string{}, "The service you want to debug")
 	return cmd
+}
+
+func getFlagset() *pflag.FlagSet {
+	result := pflag.NewFlagSet("", pflag.ContinueOnError)
+	result.String("namespace", "default", "")
+	return result
 }
