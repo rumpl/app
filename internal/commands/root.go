@@ -60,6 +60,7 @@ func addCommands(cmd *cobra.Command, dockerCli command.Cli) {
 		pullCmd(dockerCli),
 		image.Cmd(dockerCli),
 		build.Cmd(dockerCli),
+		devCmd(dockerCli),
 	)
 }
 
